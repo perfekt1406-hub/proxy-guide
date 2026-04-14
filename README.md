@@ -1,228 +1,147 @@
-# Bypassing Network Restrictions with a Cloudflare Worker Reverse Proxy
+# Guide: Building a Cloudflare Worker Reverse Proxy
 
-Most institutional networks (schools, workplaces) block content using one of two mechanisms:
+This guide explains how to build and deploy a Cloudflare Worker reverse proxy. This architecture allows you to proxy requests to an origin server through Cloudflare's edge network. This is useful for accessing resources across restricted network environments or acting as a secure intermediary for apps, IoT devices, or web clients.
 
-- **DNS/IP blocklists** — known game/entertainment domains are blocked at the network level
-- **SSL inspection** — a MITM proxy with a trusted CA cert decrypts HTTPS traffic and inspects URLs in plaintext
+## The Problem: How Wi-Fi Blocks Work
 
-A Cloudflare Worker reverse proxy defeats the first completely and significantly hardens against the second. This document explains the architecture, the evasion design decisions, and how to deploy your own.
+Most restrictive Wi-Fi networks (like those in schools, workplaces, or public hotspots) block content using one of two main mechanisms:
+
+1. **DNS/IP Blocklists:** Known domains (e.g., games, social media, entertainment) are blocked at the network level. When your device tries to look up the IP address for a blocked site, the network refuses to resolve it.
+2. **SSL Inspection (MITM):** The network installs a trusted certificate on your device to decrypt your HTTPS traffic. This allows the network administrators to inspect the exact URLs you are visiting in plaintext, even on secure connections.
+
+## The Solution: How This Proxy Bypasses Filters
+
+To get around these restrictions, we introduce a middleman: a Cloudflare Worker. Here is why this specific approach works:
+
+- **Defeating DNS/IP Blocks:** Your client (whether it's a browser, a mobile app, or an IoT device like an Arduino) never actually tries to connect to the blocked domain. Instead, it connects directly to your Cloudflare Worker. Because Cloudflare is a massive, trusted network that hosts millions of legitimate internet services, networks rarely block Cloudflare infrastructure wholesale. 
+- **Defeating SSL Inspection:** Even if the network is intercepting and reading your HTTPS traffic, they won't see the blocked domain name in the URL. We disguise the target hostname by encoding it (using base64) directly into the URL path (e.g., `/proxy/ZXhhbXBsZS5jb20/...`). Most network filters aren't sophisticated enough to actively decode and re-evaluate every single path segment; to them, it just looks like your device is requesting a harmless, random CDN asset.
+
+### High-Level Architecture
+
+```text
+Client (Web/App/IoT) → https://your-worker-name.workers.dev/proxy/{b64(host)}/path → Cloudflare Edge → Origin
+                     ←                                           + CORS headers    ←                 ← Payload/Assets
+```
+
+The client sends all requests to the Worker. The Worker decodes the true destination from the URL, fetches the data from the real origin server on your behalf, cleans up the network headers, and streams the response back to you.
 
 ---
 
-## How It Works
+## Implementation Guide
 
-```
-Browser → https://your-worker.dev/proxy/{b64(host)}/path → Cloudflare Edge → Origin
-        ←                          + CORS headers        ←                 ← HTML/assets
-```
+This guide focuses on the core concepts you need to implement. While Cloudflare Workers are written in JavaScript or TypeScript, these concepts apply to any client you might be building—from a React web app to a native iOS app, or even an Arduino written in C++.
 
-The front-end never requests blocked domains directly. All requests go to your Worker's hostname (a Cloudflare edge node). The Worker decodes the target host from the path, fetches the resource from the real origin server-side, strips framing/CSP headers that would prevent iframe embedding, injects CORS headers, and streams the response back.
+### Step 1: Prerequisites
 
-Because the Worker runs at Cloudflare's edge, the origin sees a Cloudflare IP — not the client's. The client only ever talks to your Worker hostname.
+Before you begin, you will need:
+- A free Cloudflare account — [dash.cloudflare.com/sign-up](https://dash.cloudflare.com/sign-up)
+- Node.js 18 or higher installed on your computer to run the Cloudflare deployment tools.
 
----
+### Step 2: Initialize the Project
 
-## Why This Gets Past Filters
+Start by creating a new directory for your project and initializing it with Wrangler (Cloudflare's official command-line tool):
 
-### DNS/IP blocking
-The browser makes no DNS lookup for the blocked domain. Every TCP connection is to Cloudflare's IP range. Most filters have no grounds to block `*.workers.dev` or your custom domain since they're legitimate Cloudflare infrastructure used by thousands of real services.
-
-### SSL inspection
-Even on networks that perform TLS MITM, the inspector only sees:
-
-```
-GET /proxy/d2F0Y2hkb2N1bWVudGFyaWVzLmNvbQ/wp-content/uploads/games/2048/ HTTP/2
-Host: static-assets.r3ynard.workers.dev
-```
-
-The hostname (`watchdocumentaries.com` in this example) is base64url-encoded in the path. A filter would need to actively decode and re-check every path segment to identify the target — most don't. The path looks like a CDN asset token.
-
-### Why only the hostname is encoded (not the full URL)
-Encoding the full URL into one opaque blob breaks relative URL resolution inside the proxied page. When a game page at `/proxy/{blob}` loads `js/game.js` relatively, the browser resolves it as `/proxy/js/game.js` — which the Worker can't decode. By encoding only the hostname and keeping the path verbatim, sub-resources resolve to `/proxy/{b64host}/js/game.js`, which the Worker can correctly route.
-
-### What doesn't get hidden
-On networks with SSL inspection and aggressive path scanning, a determined admin can decode base64 paths. The real protection here is that most institutional filters are signature-based, not forensic. The custom domain advice below is the stronger mitigation for aggressive environments.
-
----
-
-## URL Format
-
-| Original | Proxied |
-|---|---|
-| `https://watchdocumentaries.com/wp-content/uploads/games/2048/` | `https://your-worker/proxy/d2F0Y2hkb2N1bWVudGFyaWVzLmNvbQ/wp-content/uploads/games/2048/` |
-
-`d2F0Y2hkb2N1bWVudGFyaWVzLmNvbQ` is `watchdocumentaries.com` in base64url (no padding).
-
-Encoding in JavaScript (build-time, client, or Worker):
-```js
-const b64Host = btoa(host).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-```
-
-Decoding in the Worker:
-```js
-function decodeB64(encoded) {
-  const b64 = encoded.replace(/-/g, '+').replace(/_/g, '/');
-  const padded = b64 + '='.repeat((4 - b64.length % 4) % 4);
-  return atob(padded);
-}
-```
-
----
-
-## Worker Architecture
-
-### Path routing
-```
-/proxy/{base64url(host)}/{path...}?{query}
-```
-The regex that splits these must not include `/` in the base64 character class, otherwise it greedily matches into the path:
-```ts
-// Correct — stops at first /
-url.pathname.match(/^\/proxy\/([A-Za-z0-9_-]+)(\/.*)?$/)
-
-// Wrong — base64 char class includes / and eats the path
-url.pathname.match(/^\/proxy\/([A-Za-z0-9+/=_-]+)(\/.*)?$/)
-```
-
-### Host allowlist
-Never operate an open proxy. Maintain an explicit allowlist of hostable domains:
-```ts
-const ALLOWED_HOSTS = new Set([
-  "watchdocumentaries.com",
-  "www.watchdocumentaries.com",
-  // ...
-]);
-```
-Validate after decoding the host, before fetching anything.
-
-### Headers to strip from upstream responses
-```ts
-patched.headers.delete("X-Frame-Options");       // allows iframe embedding
-patched.headers.delete("Content-Security-Policy"); // removes frame-ancestors restrictions
-```
-
-### Headers NOT to expose to clients
-Strip any headers that fingerprint the proxy:
-- Do **not** forward `X-RateLimit-*` on success responses — they reveal proxy infrastructure
-- Do **not** return `{"status":"ok"}` on `GET /` — return a blank HTML page or a plausible-looking response
-
-### WebSocket support
-Cloudflare Workers support WebSocket proxying natively. Forward upgrade requests using the Workers WebSocket API:
-```ts
-if (request.headers.get("Upgrade")?.toLowerCase() === "websocket") {
-  return await fetch(targetUrl, {
-    headers: forwardHeaders(request.headers),
-    webSocket: true, // CF-specific
-  });
-}
-```
-Note: WebSocket proxying does **not** work in `wrangler dev` (local). It requires actual Cloudflare edge deployment.
-
-### Hop-by-hop headers
-Strip these before forwarding to the origin:
-```
-connection, keep-alive, proxy-authenticate, proxy-authorization,
-te, trailer, transfer-encoding, upgrade, host
-```
-Set `Host`, `Origin`, and `Referer` to the target origin so it responds as if directly requested.
-
----
-
-## Deployment
-
-### Prerequisites
-- Free Cloudflare account — [dash.cloudflare.com/sign-up](https://dash.cloudflare.com/sign-up)
-- Node.js 18+
-
-### Deploy
 ```bash
-cd game-proxy-worker
-npm install
-npx wrangler login   # opens browser auth first time
-npm run deploy       # prints your worker URL
+mkdir your-proxy-project
+cd your-proxy-project
+npm init -y
+npm install -D wrangler
 ```
 
-`wrangler.toml` minimum config:
+### Step 3: Configure Wrangler
+
+Create a `wrangler.toml` file in the root of your project. This file tells Cloudflare how to deploy your code. 
+
+**Why naming matters:** The `name` you choose in this file will become the first part of your Cloudflare URL (e.g., `your-worker-name.workers.dev`). If you are trying to bypass a filter, you should choose a neutral, boring name that looks like standard web infrastructure. Avoid words like "proxy", "bypass", or "game". Instead, use names like `static-assets`, `media-cache`, or `cdn-relay`.
+
 ```toml
-name = "static-assets"   # choose a neutral name — avoid "proxy", "bypass", "game"
+name = "static-assets"
 main = "src/index.ts"
 compatibility_date = "2025-01-01"
 ```
 
-### Naming matters
-Your Worker name becomes the first segment of your `workers.dev` URL:
-```
-https://{name}.{account-subdomain}.workers.dev
-```
-`static-assets`, `cdn-relay`, `media-cache` all look like infrastructure. `game-proxy` does not.
+### Step 4: Worker Architecture & Core Concepts
 
----
+Create a `src` directory and an `index.ts` file inside it. Your proxy needs to handle five core responsibilities.
 
-## Custom Domain (Strongly Recommended)
+#### 1. URL Encoding & Decoding
 
-`workers.dev` is categorised as "proxy/anonymizer" by Securly, GoGuardian, and Cisco Umbrella and is blanket-blocked on many managed networks. A custom domain on neutral hosting sidesteps this entirely.
+**Why we do this:** We need to tell the proxy where to go, but we can't put the blocked domain in plaintext, or the network filter will catch it. Furthermore, we only encode the *hostname* (like `example.com`), rather than the whole URL. If we encoded the whole URL into one massive blob, any relative links on the target webpage (like `<img src="/logo.png">`) would break. By keeping the resource path intact, standard web routing still works flawlessly.
 
-1. Add your domain to Cloudflare (free plan) and point nameservers at Cloudflare
-2. Add a route in `wrangler.toml`:
+**How to do it:**
+We use `base64url` encoding. It's just like standard base64, but it replaces `+` and `/` with URL-safe characters (`-` and `_`) so it doesn't accidentally break the URL structure.
 
-```toml
-routes = [
-  { pattern = "cdn.yourdomain.com/*", zone_name = "yourdomain.com" }
-]
-```
+- **On your Client (App, Website, Arduino):** Before making a request, your client must encode the target hostname. In a web app, you use `btoa()` and replace the unsafe characters. In an Arduino/C++ project, you would use a Base64 library.
+- **On the Worker:** Your worker intercepts the request, extracts the base64 string from the path, and decodes it back into the original hostname to figure out where to forward the traffic.
 
-3. Redeploy. Update your front-end env var to `https://cdn.yourdomain.com`.
+#### 2. Path Routing
 
-Subdomain naming: `cdn.`, `static.`, `assets.`, `media.` all blend in. Avoid anything that reads as a circumvention tool. A newly registered domain that hasn't been categorised yet will pass most filters until it's reported.
+**Why we do this:** The worker needs to cleanly separate the encoded hostname from the rest of the requested file path.
 
----
+**How to do it:** You will typically use a Regular Expression (Regex) to parse the incoming URL. It is crucial that your regex stops capturing characters as soon as it hits the first `/` after the base64 string. If your regex is too greedy, it might accidentally swallow part of the file path, causing the request to fail.
 
-## Rate Limiting
+#### 3. Host Allowlist
 
-In-memory rate limiting (per Worker isolate) is sufficient for abuse prevention but degrades on high-traffic deployments since isolates are not shared across all edge nodes. For stronger guarantees use Cloudflare's built-in rate limiting rules (available on free plans) or Durable Objects for global state.
+**Why we do this:** Security is paramount. If your proxy forwards *any* request it receives, you have created an "open proxy." Malicious actors scan the internet for open proxies to route illegal traffic, launch attacks, or spam websites. If your worker is used for this, Cloudflare will ban your account.
 
-```ts
-const RATE_WINDOW_MS = 60_000;
-const RATE_LIMIT_PER_WINDOW = 120;
-```
+**How to do it:** You must hardcode an explicit "allowlist" (a list of approved domains) into your worker. After your worker decodes the requested hostname, it must check if the host is on the allowlist. If someone tries to proxy a domain not on the list, the worker must immediately block the request and return a `403 Forbidden` error.
 
----
+#### 4. Header Modification
 
-## Testing
+**Why we do this:** HTTP requests include "headers" — metadata about the request. When you insert a proxy into the middle of a connection, you have to carefully manipulate these headers so neither the client nor the server gets confused.
 
-Encode a host manually and test end-to-end:
+**How to do it:**
+- **When forwarding to the Origin Server:** The worker must strip "hop-by-hop" headers (like `connection` or `keep-alive`), because these are only meant for a single network connection. More importantly, the worker must overwrite the `Host`, `Origin`, and `Referer` headers to match the target origin. If you don't do this, the destination server will think the request is meant for your proxy and will likely reject it.
+- **When returning data to the Client:** The worker should strip headers that might prevent you from using the data. For example, if you are building a web portal, you should delete `X-Frame-Options` and `Content-Security-Policy` so the origin site doesn't refuse to load inside an iframe. Finally, if your client is a web app making cross-origin requests, your worker must inject `Access-Control-Allow-Origin` (CORS) headers to satisfy the browser's security model. (Note: Native mobile apps and IoT devices ignore CORS, so injecting these headers is harmless for them).
+
+#### 5. WebSocket Support (Optional)
+
+**Why we do this:** Traditional HTTP is a one-way street (client asks, server answers). Modern apps and IoT devices often rely on WebSockets for real-time, two-way communication (like chat apps or live sensor data). 
+
+**How to do it:** Cloudflare Workers support WebSockets natively. Your worker just needs to check if the incoming request includes an `Upgrade: websocket` header. If it does, the worker instructs Cloudflare to establish a persistent WebSocket tunnel to the origin server instead of a standard HTTP request.
+
+### Step 5: Deploy
+
+Once your logic is written, authenticate with Cloudflare and deploy your worker:
+
 ```bash
-ENCODED=$(echo -n "watchdocumentaries.com" | base64 | tr '+/' '-_' | tr -d '=')
-curl "https://your-worker/proxy/${ENCODED}/wp-content/uploads/games/2048/"
-# Expect: 200 with game HTML
-curl "https://your-worker/proxy/${ENCODED}/wp-content/uploads/games/2048/js/application.js"
-# Expect: 200 with JavaScript
+npx wrangler login   # Opens your browser to authenticate
+npx wrangler deploy  # Deploys your code and prints your worker URL
 ```
 
-Check that blocked domains 403:
-```bash
-EVIL=$(echo -n "evil.com" | base64 | tr '+/' '-_' | tr -d '=')
-curl "https://your-worker/proxy/${EVIL}/"
-# Expect: {"error":"Forbidden: host not in allowlist or invalid path"}
-```
+*(Note: If you are building WebSocket functionality, it will not work fully in local `wrangler dev` environments. You must deploy to Cloudflare's actual edge network to test it).*
+
+### Step 6: Custom Domain (Optional but Recommended)
+
+**Why we do this:** By default, Cloudflare hosts your project on a `*.workers.dev` subdomain. Because so many people use `workers.dev` to host proxies and VPNs, extremely aggressive network filters (like Securly or Cisco Umbrella) sometimes blanket-block the entire `workers.dev` domain.
+
+**How to do it:** You can sidestep this completely by routing your worker through a custom domain name that hasn't been flagged yet.
+1. Add your custom domain to your Cloudflare account (the free tier works perfectly).
+2. Add a routing rule to your `wrangler.toml` file, telling it to route traffic from `cdn.yourdomain.com/*` to your worker.
+3. Redeploy your worker, and update your client application to point to your new custom domain.
+
+### Step 7: Testing & Client Integration
+
+Once deployed, you need to integrate the proxy into your client application. Here is how the complete flow looks in practice:
+
+**Example Flow (e.g., an Arduino fetching API data):**
+1. Your Arduino needs to fetch a temperature reading from `api.example.com/sensor-data`.
+2. The Arduino code takes `api.example.com` and base64url-encodes it, resulting in `YXBpLmV4YW1wbGUuY29t`.
+3. Instead of calling the API directly, the Arduino constructs a new URL and makes an HTTP GET request to `https://cdn.yourdomain.com/proxy/YXBpLmV4YW1wbGUuY29t/sensor-data`.
+4. Your Cloudflare Worker intercepts the request. It extracts `YXBpLmV4YW1wbGUuY29t`, decodes it back to `api.example.com`, and verifies it against the allowlist.
+5. The Worker reaches out to `https://api.example.com/sensor-data` on the Arduino's behalf.
+6. The Worker receives the JSON data from the server, strips away any problematic headers, and streams the exact payload back down to the Arduino.
 
 ---
 
 ## Troubleshooting
 
+If things aren't working, check these common pitfalls:
+
 | Symptom | Cause | Fix |
 |---|---|---|
-| 403 on all requests | Host not in `ALLOWED_HOSTS` after decode | Check that decoded host matches the allowlist exactly (with/without `www.`) |
-| 403 + wrong host decoded | Regex eating into path | Ensure base64 char class in regex is `[A-Za-z0-9_-]` with no `/` |
-| Assets 404 after HTML loads | `<base href>` pointing off-proxy | Do not inject `<base href>` — keep paths verbatim so relative URLs resolve through the proxy |
-| WebSocket games freeze | Running `wrangler dev` locally | WebSocket proxy requires real Cloudflare edge; deploy to test |
-| CORS errors | `ALLOWED_ORIGINS` set but origin mismatch | Check `ALLOWED_ORIGINS` env var or remove it to fall back to `*` |
-| `workers.dev` blocked on network | Filter has `workers.dev` category blocked | Set up a custom domain |
-
----
-
-## Limits
-
-- **Free plan:** 100,000 requests/day, 10ms CPU time per request
-- CPU limit is per-request compute, not wall time — proxying is mostly I/O so this is rarely hit
-- No persistent storage without Durable Objects or KV (not needed for a pure proxy)
+| **403 Forbidden on all requests** | Host not in Allowlist | Ensure the decoded host matches your allowlist exactly. Be careful with `www.` prefixes; `example.com` and `www.example.com` are technically different hosts. |
+| **403 + Wrong Host Decoded** | Parsing Error | Your URL router is likely too greedy. Ensure your path routing logic isn't accidentally consuming the rest of the URL path alongside the base64 string. |
+| **CORS Errors (Browser Only)** | Origin Mismatch | If you are testing in a web browser, ensure the worker is successfully injecting the `Access-Control-Allow-Origin` header into the response. |
+| **Connection Freezes** | Local Environment | If you are testing WebSockets, ensure you are testing against the deployed Cloudflare worker, not `wrangler dev`. |
+| **Complete Block / Timeout** | Network Filter | The network may be blocking all `workers.dev` traffic. Set up a custom domain (Step 6) to bypass this. |
