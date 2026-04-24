@@ -1,0 +1,3 @@
+# Markdown-only guide; ignore OS files.
+.DS_Store
+*.log
